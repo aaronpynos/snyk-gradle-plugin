@@ -1,4 +1,5 @@
 import groovy.json.JsonOutput
+import groovy.json.StreamingJsonBuilder
 import java.util.regex.Pattern
 import java.util.regex.Matcher
 
@@ -74,33 +75,23 @@ allprojects { everyProj ->
         // currentChain is a protection against dependency cycles, which are perfectly normal in Java/Gradle world
         // This function converts a Gradle dependency tree into DepTree structure used by Snyk CLI
         def depsToDict
-        depsToDict = { Iterable deps, Set currentChain ->
-            def res = [:]
+        depsToDict = { def json, Iterable deps, Set currentChain ->
+            def processed = [] as Set<String>
             deps.each { d ->
-                def depName = d.moduleGroup + ':' + d.moduleName
-                if (!currentChain.contains(depName)) {
-                    def row = ['name': depName, 'version': d.moduleVersion, 'conf': d.configuration]
-                    currentChain.add(depName)
-                    def subDeps = depsToDict(d.children, currentChain)
-                    currentChain.remove(depName)
-                    if (subDeps.size() > 0) {
-                        row['dependencies'] = subDeps
-                    }
-                    // In Gradle 2, there can be several instances of the same dependency present at each level,
-                    // each for a different configuration. In this case, we need to merge the dependencies.
-                    if (res.containsKey(depName)) {
-                        if (subDeps.size() > 0) {
-                            if (!res[depName].containsKey('dependencies')) {
-                                res[depName]['dependencies'] = [:]
+                def depName = d.moduleGroup + ":" + d.moduleName
+                if (processed.add("${depName}:${d.moduleVersion};${d.configuration}")) {
+                    json."${depName}" {
+                        name depName
+                        version d.moduleVersion
+                        conf d.configuration
+                        if (d.children.size() > 0) {
+                            dependencies {
+                                depsToDict(delegate, d.children, currentChain)
                             }
-                            res[depName]['dependencies'].putAll(subDeps)
                         }
-                    } else {
-                        res[depName] = row
                     }
                 }
             }
-            return res
         }
 
         def matchesAttributeFilter
@@ -132,14 +123,11 @@ allprojects { everyProj ->
         doLast { task ->
             if (!snykMergedDepsConfExecuted) {
                 println('SNYKECHO snykResolvedDepsJson task is executing via doLast')
+                def writer = new StringWriter()
+                def jsonBuilder = new StreamingJsonBuilder(writer)
                 def projectsDict = [:]
                 def defaultProjectName = task.project.name
-                def result = [
-                    'defaultProject': defaultProjectName,
-                    'projects': projectsDict,
-                    'allSubProjectNames': allprojects.collect { it.name }
-                ]
-
+                
                 def shouldScanProject = {
                     onlyProj == null ||
                     (onlyProj == '.' && it.name == defaultProjectName) ||
@@ -177,61 +165,76 @@ allprojects { everyProj ->
                 // due to ambiguous resolution of dependency variants
                 println("JSONATTRS " + JsonOutput.toJson(attributesAsStrings))
 
-                rootProject.allprojects.findAll(shouldScanProject).each { proj ->
-                    println('SNYKECHO processing project: ' + proj.name)
-                    def snykConf = null
-                    def mergeableConfs = proj.configurations
-                        .findAll({ it.name != 'snykMergedDepsConf' && it.name =~ confNameFilter })
+                jsonBuilder {
+                    defaultProject defaultProjectName
+                    
+                    projects {
+                        def projDelegate = delegate
+                        rootProject.allprojects.findAll(shouldScanProject).each { proj ->
+                            println('SNYKECHO processing project: ' + proj.name)
+                            def snykConf = null
+                            def mergeableConfs = proj.configurations
+                                .findAll({ it.name != 'snykMergedDepsConf' && it.name =~ confNameFilter })
 
-                    // Drop all the configrations that don't match the attribute filter
-                    if (confAttrSpec != null) {
-                        mergeableConfs = mergeableConfs.findAll(matchesAttributeFilter)
-                    }
+                            // Drop all the configrations that don't match the attribute filter
+                            if (confAttrSpec != null) {
+                                mergeableConfs = mergeableConfs.findAll(matchesAttributeFilter)
+                            }
 
-                    if (mergeableConfs.size() == 0 && proj.configurations.size() > 0) {
+                            if (mergeableConfs.size() == 0 && proj.configurations.size() > 0) {
 
-                        throw new RuntimeException('Matching configurations not found: ' + confNameFilter +
-                                ', available configurations for project ' + proj + ': '
-                                + proj.configurations.collect { it.name })
+                                throw new RuntimeException('Matching configurations not found: ' + confNameFilter +
+                                        ', available configurations for project ' + proj + ': '
+                                        + proj.configurations.collect { it.name })
 
-                    } else if (mergeableConfs.size() == 1) {
+                            } else if (mergeableConfs.size() == 1) {
 
-                        // We use the only matching configuration, with its attributes.
-                        snykConf = mergeableConfs.first()
+                                // We use the only matching configuration, with its attributes.
+                                snykConf = mergeableConfs.first()
 
-                    } else if (mergeableConfs.size() > 1) {
+                            } else if (mergeableConfs.size() > 1) {
 
-                        println('SNYKECHO constructing merged configuration from ' + mergeableConfs.collect { conf -> conf.name })
-                        // We create a new, "merged" configuration here.
-                        snykConf = proj.configurations.create('snykMergedDepsConf')
+                                println('SNYKECHO constructing merged configuration from ' + mergeableConfs.collect { conf -> conf.name })
+                                // We create a new, "merged" configuration here.
+                                snykConf = proj.configurations.create('snykMergedDepsConf')
 
-                        mergeableConfs.each { snykConf.extendsFrom(it) }
+                                mergeableConfs.each { snykConf.extendsFrom(it) }
 
-                        // Copy all the unambiguous build attributes into the merged configuration
-                        // Gradle before version 3 does not support attributes
-                        if (snykConf.hasProperty('attributes')) {
-                            allConfigurationAttributes.each({ attr, valueSet ->
-                                if (valueSet.size() == 1) {
-                                    snykConf.attributes.attribute(attr, valueSet.head())
+                                // Copy all the unambiguous build attributes into the merged configuration
+                                // Gradle before version 3 does not support attributes
+                                if (snykConf.hasProperty('attributes')) {
+                                    allConfigurationAttributes.each({ attr, valueSet ->
+                                        if (valueSet.size() == 1) {
+                                            snykConf.attributes.attribute(attr, valueSet.head())
+                                        }
+                                    })
                                 }
-                            })
+                            }
+                            projDelegate."${proj.name}" {
+                                delegate.targetFile proj.buildFile.toString()
+                            
+                                if (snykConf != null) {
+                                    println('SNYKECHO resolving configuration ' + snykConf.name)
+                                    def gradleDeps = snykConf.resolvedConfiguration.firstLevelModuleDependencies
+                                    println('SNYKECHO converting the dependency graph to the DepTree format')
+                                    delegate.depDict {
+                                        depsToDict(delegate, gradleDeps, new HashSet())
+                                    }
+                                    // projectsDict[proj.name] = [
+                                    //     'targetFile': findProject(proj.path).buildFile.toString(),
+                                    //     'depDict': depsToDict(gradleDeps, new HashSet())
+                                    // ]
+                                }
+                                // projectsDict[proj.name] = [
+                                //     'targetFile': findProject(proj.path).buildFile.toString()
+                                // ]
+                            }
                         }
                     }
-                    if (snykConf != null) {
-                        println('SNYKECHO resolving configuration ' + snykConf.name)
-                        def gradleDeps = snykConf.resolvedConfiguration.firstLevelModuleDependencies
-                        println('SNYKECHO converting the dependency graph to the DepTree format')
-                        projectsDict[proj.name] = [
-                            'targetFile': findProject(proj.path).buildFile.toString(),
-                            'depDict': depsToDict(gradleDeps, new HashSet())
-                        ]
-                    } else {
-                        projectsDict[proj.name] = [
-                            'targetFile': findProject(proj.path).buildFile.toString()
-                        ]
-                    }
+                    
+                    allSubProjectNames allprojects.collect { it.name }
                 }
-                println("JSONDEPS " + JsonOutput.toJson(result))
+                println("JSONDEPS " + writer.toString())
                 snykMergedDepsConfExecuted = true
             }
         }
